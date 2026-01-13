@@ -1,6 +1,5 @@
-/admin_dicord_id.txt
-/tweepy_tokens.ini
-/Twitter_Accounts.xlsx
-/Twitter_Accounts - COPY.xlsx
-/discord_token.txt
 /discord.log
+*.log
+.env
+watchlist.txt
+seen_tweets.json

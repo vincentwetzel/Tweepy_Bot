@@ -1,307 +1,129 @@
-# TODO: make better docs throughout
-
 import discord
-import pandas
-from discord.ext import commands
-import asyncio
-
-import tweepy
-
-import json
+from discord.ext import commands, tasks
+import feedparser
 import os
-
-from typing import List
-
+import json
+import re
 import logging
+from logging.handlers import RotatingFileHandler
 from datetime import datetime
+from dotenv import load_dotenv
 
-from http.client import IncompleteRead
+# --- 1. CONFIGURATION ---
+load_dotenv()
+DISCORD_TOKEN = os.getenv("DISCORD_TOKEN")
+# Convert IDs to integers since .env stores them as strings
+OWNER_ID = int(os.getenv("OWNER_ID", 0))
+CHANNEL_ID = int(os.getenv("CHANNEL_ID", 0))
 
-from discord.ext.commands import CommandNotFound
+ACCOUNTS_FILE = "watchlist.txt"
+SEEN_FILE = "seen_tweets.json"
+# 2026 Redundant Nitter Instances
+NITTER_INSTANCES = ["xcancel.com", "nitter.net", "nitter.privacydev.net"]
 
-BOT_GUILD_ID = None
+# --- 2. LOGGING SETUP (Rotating) ---
+log_handler = RotatingFileHandler(
+    filename='discord.log',
+    maxBytes=5 * 1024 * 1024,  # 5MB limit
+    backupCount=2,
+    encoding='utf-8'
+)
+logging.basicConfig(handlers=[log_handler], level=logging.INFO,
+                    format='%(asctime)s - %(levelname)s - %(message)s')
 
-logger = logging.getLogger('discord')
-logger.setLevel(logging.DEBUG)
-handler = logging.FileHandler(filename='discord.log', encoding='utf-8', mode='w')
-handler.setFormatter(logging.Formatter('%(asctime)s:%(levelname)s:%(name)s: %(message)s'))
-logger.addHandler(handler)
+# --- 3. DATA PERSISTENCE & FILE WATCHING ---
+WATCHED_ACCOUNTS = []
+last_file_mod_time = 0
 
-# Initialize Bot settings
-description = '''This is Vincent's Twitter Bot. Use the !command syntax to send a command to the bot.'''
-bot = commands.Bot(command_prefix='!', description=description)
 
-ADMIN_DISCORD_ID = None
+def refresh_accounts():
+    """Reads watchlist.txt and extracts handles via Regex."""
+    global WATCHED_ACCOUNTS, last_file_mod_time
+    if not os.path.exists(ACCOUNTS_FILE):
+        return
 
-tracked_ids: List[str] = list()
-tracked_accounts: List[str] = list()
+    m_time = os.path.getmtime(ACCOUNTS_FILE)
+    if m_time > last_file_mod_time:
+        with open(ACCOUNTS_FILE, "r") as f:
+            content = f.read()
+            # Regex extracts anything inside double quotes (handles formats provided)
+            found = re.findall(r'"([A-Za-z0-9_]{1,15})"', content)
+
+            ignore = {'chat', 'grok', 'bookmarks', 'communities', 'premium_sign_up', 'post', 'home', 'explore',
+                      'messages', 'settings'}
+            WATCHED_ACCOUNTS = [u for u in found if u.lower() not in ignore]
+
+        last_file_mod_time = m_time
+        logging.info(f"Watchlist reloaded: {len(WATCHED_ACCOUNTS)} accounts.")
+
+
+def load_seen():
+    if os.path.exists(SEEN_FILE):
+        with open(SEEN_FILE, 'r') as f: return json.load(f)
+    return {}
+
+
+def save_seen(data):
+    with open(SEEN_FILE, 'w') as f: json.dump(data, f)
+
+
+last_seen_tweets = load_seen()
+
+# --- 4. BOT & TASKS ---
+intents = discord.Intents.default()
+intents.message_content = True
+bot = commands.Bot(command_prefix='!', intents=intents)
 
 
 @bot.event
 async def on_ready():
-    await log_msg_to_server_owner(await pad_message("Tweepy Bot is now online!") + "\n", False)
-
-    asyncio.create_task(init_Tweepy())
-
-
-async def init_Tweepy() -> None:
-    """
-    TODO: Doc this
-    :param loop:
-    :return:
-    """
-    # Init tokens
-    with open("tweepy_tokens.ini", 'r') as f:
-        consumer_key = ""
-        consumer_secret = ""
-        access_token = ""
-        access_token_secret = ""
-
-        lines = f.readlines()
-
-        for line in lines:
-            if "consumer_key=" in line:
-                consumer_key = line.split("consumer_key=")[1].strip()
-            elif "consumer_secret=" in line:
-                consumer_secret = line.split("consumer_secret=")[1].strip()
-            elif "access_token=" in line:
-                access_token = line.split("access_token=")[1].strip()
-            elif "access_token_secret=" in line:
-                access_token_secret = line.split("access_token_secret=")[1].strip()
-            else:
-                raise Exception("The settings failed to initiate from the settings fname.")
-
-    auth = tweepy.OAuthHandler(consumer_key, consumer_secret)
-    auth.set_access_token(access_token, access_token_secret)
-    tweepy_api = tweepy.API(auth, wait_on_rate_limit=True, wait_on_rate_limit_notify=True,
-                            retry_count=10, retry_delay=5, retry_errors=[503])
-
-    # initialize streams
-    xlsx = pandas.ExcelFile("Twitter_Accounts.xlsx")
-    changed = False
-    data_frames: List[pandas.DataFrame] = list()
-    for sheet_name in xlsx.sheet_names:
-        df: pandas.DataFrame = pandas.read_excel(xlsx, sheet_name, usecols=["Account", "Twitter_ID"])
-        df.name = sheet_name
-        data_frames.append(df)
-        for idx, row in df.iterrows():
-            if pandas.isnull(row["Twitter_ID"]) or (type(row["Twitter_ID"]) == str and not row["Twitter_ID"].isdigit()):
-                # Excel fname contains a blank Twitter_ID OR a misformatted Twitter_ID
-                val = tweepy_api.get_user(screen_name=row["Account"]).id
-                df.loc[idx, "Twitter_ID"] = val
-                changed = True
-
-    if changed:
-        with pandas.ExcelWriter("Twitter_Accounts.xlsx", engine="xlsxwriter") as writer:
-            for df in data_frames:
-                df.to_excel(writer, df.name, index=False)
-            writer.save()
-
-    global tracked_ids
-    global tracked_accounts
-
-    for df in data_frames:
-        for idx, row in df.iterrows():
-            tracked_accounts.append(row["Account"])
-            tracked_ids.append(int(row["Twitter_ID"]))
-        # await asyncio.sleep(900)
-    asyncio.create_task(init_tweepy_streams(tweepy_api, tracked_ids, "twitter", True))
-    await (await get_text_channel(bot.get_guild(BOT_GUILD_ID), "twitter")).send(
-        await pad_message("Tweepy initialization complete!"))
-
-    await log_msg_to_server_owner("Tweepy has been fully initialized!")
+    if not OWNER_ID or not CHANNEL_ID:
+        logging.critical("Missing IDs in .env file!")
+        return
+    print(f"[{datetime.now()}] Bot online. Monitoring {ACCOUNTS_FILE}")
+    refresh_accounts()
+    check_twitter_rss.start()
+    monthly_reminder.start()
 
 
-async def init_tweepy_streams(tweepy_api: tweepy.API, twitter_id_list: List[int], message_channel_name: str,
-                              skip_retweets: bool) -> None:
-    """
-    Initializes a Tweepy stream.
-    :param tweepy_api: The Tweepy API in use
-    :param twitter_id_list: A list of Twitter IDs
-    :param message_channel_name: The channel to message when any of these Users tweet.
-    :param skip_retweets: Whether or not retweets/mentions should be documented.
-    :return: None
-    """
-    message_channel: discord.TextChannel = await get_text_channel(bot.get_guild(BOT_GUILD_ID),
-                                                                  message_channel_name)
-    stream_listener: tweepy.StreamListener = TweepyStreamListener(discord_message_method=message_channel.send,
-                                                                  async_loop=asyncio.get_event_loop(),
-                                                                  skip_retweets=skip_retweets)
+@tasks.loop(minutes=5)
+async def check_twitter_rss():
+    refresh_accounts()  # Check for file updates automatically
+    channel = bot.get_channel(CHANNEL_ID)
+    if not channel or not WATCHED_ACCOUNTS: return
 
-    stream: tweepy.Stream = tweepy.Stream(auth=tweepy_api.auth, listener=stream_listener, tweet_mode='extended')
-    stream.filter(follow=[str(x) for x in twitter_id_list], is_async=True, stall_warnings=True)
-
-
-async def get_text_channel(guild: discord.Guild, channel_name: str) -> discord.TextChannel:
-    """
-    Gets the text channel requested, creates if the channel does not exist.
-    :param guild: The Guild for this request
-    :param channel_name: The channel to be fetched or created
-    :return: The Text Channel object
-    """
-    # Find the channel if it exists
-    for channel in list(guild.text_channels):
-        if channel.name == channel_name:
-            return channel
-
-    # If no Text Channel with this name exists, create one.
-    return await guild.create_text_channel(channel_name, reason="Text Channel was requested but did not exist.")
-
-
-async def log_msg_to_server_owner(msg: str, add_time_and_date: bool = True, tts_param=False):
-    """
-    Sends a DM to the bot's owner.
-    :param msg: The message to send
-    :param add_time_and_date: Prepend information about the date and time of the logging item
-    :param tts_param: Text-to-speech option
-    :return:
-    """
-    msg = await add_time_and_date_to_string(msg) if (add_time_and_date is True) else msg
-    await (await bot.fetch_user(ADMIN_DISCORD_ID)).send(msg, tts=tts_param)
-
-
-async def add_time_and_date_to_string(msg):
-    return datetime.now().strftime("%m-%d-%y") + "\t" + datetime.now().strftime("%I:%M:%S%p") + "\t" + msg
-
-
-def init_value_from_file(fname: str) -> str:
-    """
-    This is used to initialize a text value from a file
-    :param fname: The filename from which to get the value.
-    :return: The value as a str
-    """
-    if not os.path.exists(fname):
-        with open(fname, 'a') as f:  # 'a' opens for appending without truncating
-            token = input(
-                fname + " does not exist. Please enter the value that is supposed to be stored in this file: ")
-            f.write(token)
-    else:
-        with open(fname, 'r+') as f:  # 'r+' is reading/writing mode, stream positioned at start of fname
-            token = f.readline().rstrip('\n')  # readline() usually has a \n at the end of it
-            if not token:
-                token = input(fname + " is empty. Please enter the value that is supposed to be stored in this file: ")
-                f.write(token)
-    return token
-
-
-def init_admin_discord_id(id_fname: str) -> int:
-    """
-    Initializes the owner ID so the bot knows who is in charge.
-    :param id_fname: The name of the fname that contains the admin's id number
-    :return: The ID of the admin user as a string.
-    """
-    if os.path.isfile("admin_dicord_id.txt"):
-        with open("admin_dicord_id.txt", 'r') as f:
+    for user in WATCHED_ACCOUNTS:
+        for instance in NITTER_INSTANCES:
             try:
-                line = f.readline().strip()
-                if line and len(line) == 18:  # Discord IDs are 18 characters.
-                    try:
-                        return int(line)
-                    except ValueError as e:
-                        print(e)
-                        print("There was an issue with the discord ID found in " + id_fname
-                              + ". This fname should only contain an 18-digit number and nothing else")
-            except EOFError as e:
-                print(e)
-                print(id_fname + " is empty. This fname must contain the user ID of the bot's admin")
-    with open("admin_dicord_id.txt", "w") as f:
-        id = input("Please enter the Discord ID number for the admin you want this bot to report to: ")
-        f.write(id)
-        return id
+                url = f"https://{instance}/{user}/rss"
+                feed = feedparser.parse(url)
+                if not feed.entries: continue
+
+                latest_id = feed.entries[0].id
+                if last_seen_tweets.get(user) != latest_id:
+                    # Don't post old tweets when adding a brand new account
+                    is_new_in_memory = user not in last_seen_tweets
+                    last_seen_tweets[user] = latest_id
+                    save_seen(last_seen_tweets)
+
+                    if not is_new_in_memory:
+                        link = feed.entries[0].link.replace(instance, "x.com")
+                        await channel.send(f"🐦 **{user}** posted:\n{link}")
+                break  # Success with this instance, move to next user
+            except Exception as e:
+                logging.error(f"Nitter {instance} failed for {user}: {e}")
+                continue
 
 
-async def pad_message(msg, add_time_and_date=True, dash_count=75) -> str:
-    """
-    Pads a message with stars
-    :param msg: The message
-    :param add_time_and_date: Adds time and date
-    :param dash_count: The number of stars to use in the padding
-    :return: A new string with the original message padded with stars.
-    """
-    if add_time_and_date:
-        msg = "\n" + (await add_time_and_date_to_string(msg)) + "\n"
-    else:
-        msg = "\n" + msg + "\n"
-    # dash_count = len(log_msg) - 2
-    for x in range(dash_count):
-        msg = "-".join(["", msg, ""])
-    return msg
-
-
-@bot.event
-async def on_command_error(ctx, error):
-    if isinstance(error, CommandNotFound):
-        return
-    raise error
-
-
-def pp_jsonn(json_thing, sort=True, indents=4):
-    if type(json_thing) is str:
-        print(json.dumps(json.loads(json_thing), sort_keys=sort, indent=indents))
-    else:
-        print(json.dumps(json_thing, sort_keys=sort, indent=indents))
-    return None
-
-
-class TweepyStreamListener(tweepy.StreamListener):
-    def __init__(self, discord_message_method, async_loop, skip_retweets=False, *args, **kwargs):
-        super().__init__(*args, **kwargs)
-        self.discord_message_method = discord_message_method
-        self.async_loop = async_loop
-        self.skip_retweets = skip_retweets
-
-    def on_status(self, status: tweepy.Status) -> None:
-        """
-        # Executes when a new status is Tweeted.
-        :param status: The status
-        :return: None
-        """
-
-        # Only log tweets authored or retweeted by the tracked User.
-        if status.user.screen_name in tracked_accounts:
-            self.send_message("https://twitter.com/" + status.user.screen_name + "/status/" + str(status.id))
-        else:
-            return
-
-    def on_exception(self, exception):
-        print("on_exception has caught the following exception:" + str(exception))
-        return
-
-    def on_error(self, status_code) -> None:
-        """
-        Tweepy error handling method
-        :param status_code: The Twitter error code (not an HTTP code)
-        :return: None
-        """
-        future = asyncio.run_coroutine_threadsafe(
-            self.discord_message_method("Error Code (" + str(status_code) + ")"), self.async_loop)
-        future.result()
-
-    def send_message(self, msg) -> None:
-        """
-        # Sends a message
-        :param msg:
-        :return:
-        """
-        # Submit the coroutine to a given loop
-        future = asyncio.run_coroutine_threadsafe(self.discord_message_method(msg), self.async_loop)
-        # Wait for the result with an optional timeout argument
-        future.result()
-
-
-if __name__ == "__main__":
+@tasks.loop(hours=720)  # 30 Days
+async def monthly_reminder():
+    """DMs the owner to refresh the account list."""
     try:
-        ADMIN_DISCORD_ID = int(init_admin_discord_id("admin_discord_id.txt"))
-    except TypeError as e:
-        print(e)
-        print("This error means that there is something wrong with your admin_discord_id.txt fname.")
-    # global BOT_GUILD_ID
-    try:
-        BOT_GUILD_ID = int(init_value_from_file("bot_guild_id.txt"))
-    except TypeError:
-        print(e)
-        print(
-            "This error means that the value initialized from bot_guild_id.txt was unable to convert to an integer."
-            "Please make sure that this text file stores an integer value.")
+        user = await bot.fetch_user(OWNER_ID)
+        if user:
+            await user.send("📅 **Reminder**: Sync your `watchlist.txt` with your latest X notifications!")
+    except Exception as e:
+        logging.error(f"Reminder failed: {e}")
 
-    bot.run(init_value_from_file("discord_token.txt"))
+
+bot.run(DISCORD_TOKEN, log_handler=log_handler)
